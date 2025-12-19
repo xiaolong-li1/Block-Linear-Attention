@@ -143,7 +143,7 @@ def _attn_fwd(
         denom = tl.full([BLOCK_M], float("inf"), dtype=tl.float32)
 
     # Compute output: O = (Q^phi @ H) / denom
-    o = tl.dot(c_q.to(tl.float32), h_acc.to(c_q.dtype)) / tl.maximum(denom[:, None], 1e-6)
+    o = tl.dot(c_q.to(tl.float32), h_acc) / tl.maximum(denom[:, None], 1e-6)
 
     tl.store(O_ptrs, o.to(O.type.element_ty), mask=offs_m[:, None] < L)
     tl.store(DENOM_ptrs, denom, mask=offs_m < L)
@@ -288,7 +288,9 @@ def _attn_bwd_dhdz(
     DO_ptrs = DO + do_offset + offs_m[:, None] * D + offs_d[None, :]
     DENOM_ptrs = DENOM + denom_offset + offs_m
     DELTA_ptrs = DELTA + delta_offset + offs_m
-    KBID_ptr = KBID + kbid_offset + idx_n
+    # Use base pointer for KBID - compute offset from loop index to avoid
+    # compiler optimization issues with pointer updates in loops
+    KBID_base = KBID + kbid_offset + idx_n
     DH_ptrs = DH + dh_offset + offs_cd[:, None] * D + offs_d[None, :]
     DZ_ptrs = DZ + dz_offset + offs_cd
 
@@ -296,7 +298,10 @@ def _attn_bwd_dhdz(
     dz = tl.zeros([CD], dtype=tl.float32)
 
     for idx_m in tl.range(0, L, BLOCK_M2):
-        kbid = tl.load(KBID_ptr)
+        # Compute query block index from loop variable
+        query_block_idx = idx_m // BLOCK_M
+        # Load kbid from computed offset (not from updated pointer)
+        kbid = tl.load(KBID_base + query_block_idx * N_BLOCKS)
         if kbid == 1:  # This KV block was selected by this query block
             m_mask = offs_m < L - idx_m
 
@@ -319,8 +324,6 @@ def _attn_bwd_dhdz(
         DO_ptrs += BLOCK_M2 * D
         DENOM_ptrs += BLOCK_M2
         DELTA_ptrs += BLOCK_M2
-        if (idx_m + BLOCK_M2) % BLOCK_M == 0:
-            KBID_ptr += N_BLOCKS
 
     tl.store(DH_ptrs, dh.to(DH.type.element_ty))
     tl.store(DZ_ptrs, dz.to(DZ.type.element_ty))
