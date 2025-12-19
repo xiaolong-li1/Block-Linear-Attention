@@ -28,22 +28,16 @@ from .utils import get_block_map
 
 
 class SparseLinearAttention(nn.Module):
-    def __init__(self, head_dim, topk, feature_map='softmax', BLKQ=64, BLKK=64, use_bf16=True, tie_feature_map_qk=True):
+    def __init__(self, topk, feature_map='softmax', BLKQ=64, BLKK=64, use_bf16=True):
         """
         Sparse Linear Attention module.
 
-        This is a modified version that removes the Softmax attention branch entirely.
-        Only Linear Attention is performed on selected (Mask=1) KV blocks.
-        Non-selected (Mask=0) KV blocks are completely skipped.
-
         Args:
-            head_dim: Dimension of each attention head.
             topk: Ratio of KV blocks selected for sparse attention (0.0 to 1.0).
             feature_map: Feature map for linear attention, one of ['elu', 'relu', 'softmax'].
             BLKQ: Block size for queries.
             BLKK: Block size for keys/values.
             use_bf16: Whether to use bfloat16 (default) or float16 for computation.
-            tie_feature_map_qk: Whether to use the same feature map for query and key.
         """
         super().__init__()
         self.dtype = torch.bfloat16 if use_bf16 else torch.float16
@@ -67,9 +61,6 @@ class SparseLinearAttention(nn.Module):
             self.feature_map_k = softmax_feature_map
         else:
             raise NotImplementedError(f'Not supported feature map {feature_map}.')
-
-        if tie_feature_map_qk:
-            self.feature_map_k = self.feature_map_q
 
     def forward(self, q, k, v, return_sparsity=False):
         """
@@ -126,70 +117,5 @@ class SparseLinearAttention(nn.Module):
 
         if return_sparsity:
             return o, real_topk / sparse_map.shape[-1]
-        else:
-            return o
-
-
-class SparseLinearAttentionWithProjection(nn.Module):
-    def __init__(self, head_dim, topk, feature_map='softmax', BLKQ=64, BLKK=64, use_bf16=True, tie_feature_map_qk=True):
-        """
-        Sparse Linear Attention with an optional learnable projection layer.
-
-        This version includes a projection layer similar to the original SLA,
-        but without the Softmax branch. The projection can be used to learn
-        residual corrections.
-
-        Args:
-            head_dim: Dimension of each attention head.
-            topk: Ratio of KV blocks selected for sparse attention (0.0 to 1.0).
-            feature_map: Feature map for linear attention.
-            BLKQ: Block size for queries.
-            BLKK: Block size for keys/values.
-            use_bf16: Whether to use bfloat16 or float16.
-            tie_feature_map_qk: Whether to use the same feature map for Q and K.
-        """
-        super().__init__()
-        self.sparse_attn = SparseLinearAttention(
-            head_dim=head_dim,
-            topk=topk,
-            feature_map=feature_map,
-            BLKQ=BLKQ,
-            BLKK=BLKK,
-            use_bf16=use_bf16,
-            tie_feature_map_qk=tie_feature_map_qk
-        )
-        self.proj = nn.Linear(head_dim, head_dim, dtype=torch.float32)
-        self.init_weights_()
-
-    def init_weights_(self):
-        with torch.no_grad():
-            nn.init.zeros_(self.proj.weight)
-            nn.init.zeros_(self.proj.bias)
-
-    def forward(self, q, k, v, return_sparsity=False):
-        """
-        Forward pass with optional projection.
-
-        Args:
-            q: Queries of shape (B, H, L, D).
-            k: Keys of shape (B, H, L, D).
-            v: Values of shape (B, H, L, D).
-            return_sparsity: Whether to return the actual sparsity ratio.
-
-        Returns:
-            o: Output tensor of shape (B, H, L, D).
-            sparsity (optional): Actual sparsity ratio if return_sparsity=True.
-        """
-        if return_sparsity:
-            o, sparsity = self.sparse_attn(q, k, v, return_sparsity=True)
-        else:
-            o = self.sparse_attn(q, k, v, return_sparsity=False)
-
-        # Apply learnable projection
-        with torch.amp.autocast('cuda', dtype=self.sparse_attn.dtype):
-            o = o + self.proj(o)
-
-        if return_sparsity:
-            return o, sparsity
         else:
             return o
