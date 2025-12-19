@@ -436,22 +436,29 @@ class _sparse_linear_attention(torch.autograd.Function):
 
         # For backward: we need to recompute H_acc and Z_acc per query block
         # Store them during forward for efficiency
-        h_acc = torch.empty((B, H, M_BLOCKS, CD, D), device=v.device, dtype=v.dtype)
-        z_acc = torch.empty((B, H, M_BLOCKS, CD), device=v.device, dtype=v.dtype)
+        # Vectorized implementation to avoid Python for loops
+        h_flat = h.view(B * H, N_BLOCKS, CD, D)  # [BH, N, CD, D]
+        z_flat = z.view(B * H, N_BLOCKS, CD)      # [BH, N, CD]
+        lut_flat = lut.view(B * H, M_BLOCKS, topk)  # [BH, M, topk]
 
-        # Compute accumulated H_i and Z_i for each query block (needed for dQ^phi)
-        # This is done on CPU for simplicity, or we can add another kernel
-        h_flat = h.view(B * H, N_BLOCKS, CD, D)
-        z_flat = z.view(B * H, N_BLOCKS, CD)
-        lut_flat = lut.view(B * H, M_BLOCKS, topk)
-        h_acc_flat = h_acc.view(B * H, M_BLOCKS, CD, D)
-        z_acc_flat = z_acc.view(B * H, M_BLOCKS, CD)
+        # Use advanced indexing to gather h and z values
+        # lut_expanded for h: [BH, M, topk] -> [BH, M, topk, CD, D]
+        lut_h = lut_flat.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, CD, D)
+        # h_flat expanded: [BH, N, CD, D] -> [BH, 1, N, CD, D]
+        h_expanded = h_flat.unsqueeze(1).expand(-1, M_BLOCKS, -1, -1, -1)
+        # Gather: [BH, M, topk, CD, D]
+        h_gathered = torch.gather(h_expanded, 2, lut_h)
+        # Sum over topk: [BH, M, CD, D]
+        h_acc = h_gathered.sum(dim=2).view(B, H, M_BLOCKS, CD, D)
 
-        for bh in range(B * H):
-            for m in range(M_BLOCKS):
-                indices = lut_flat[bh, m, :topk]  # [topk]
-                h_acc_flat[bh, m] = h_flat[bh, indices].sum(dim=0)  # [CD, D]
-                z_acc_flat[bh, m] = z_flat[bh, indices].sum(dim=0)  # [CD]
+        # lut_expanded for z: [BH, M, topk] -> [BH, M, topk, CD]
+        lut_z = lut_flat.unsqueeze(-1).expand(-1, -1, -1, CD)
+        # z_flat expanded: [BH, N, CD] -> [BH, 1, N, CD]
+        z_expanded = z_flat.unsqueeze(1).expand(-1, M_BLOCKS, -1, -1)
+        # Gather: [BH, M, topk, CD]
+        z_gathered = torch.gather(z_expanded, 2, lut_z)
+        # Sum over topk: [BH, M, CD]
+        z_acc = z_gathered.sum(dim=2).view(B, H, M_BLOCKS, CD)
 
         ctx.save_for_backward(c_q, c_k, v, k_block_id, lut, denom, o, h, z, h_acc, z_acc)
         ctx.topk = topk
