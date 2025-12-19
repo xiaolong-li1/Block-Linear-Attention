@@ -69,7 +69,7 @@ def _attn_fwd_preprocess(
 
 @triton.jit
 def _attn_fwd(
-    CQ, H, Z, LUT, DENOM, O,
+    CQ, H, Z, LUT, DENOM, O, H_ACC, Z_ACC,
     topk: tl.constexpr,
     L: tl.constexpr,
     M_BLOCKS: tl.constexpr,
@@ -95,6 +95,8 @@ def _attn_fwd(
         LUT: Look-up table of selected KV block indices, shape [B*H, M_BLOCKS, topk]
         DENOM: Output denominator for backward, shape [B*H, L]
         O: Output tensor, shape [B*H, L, D]
+        H_ACC: Output accumulated H per query block, shape [B*H, M_BLOCKS, CD, D]
+        Z_ACC: Output accumulated Z per query block, shape [B*H, M_BLOCKS, CD]
     """
     idx_m = tl.program_id(0).to(tl.int64)
     idx_bh = tl.program_id(1).to(tl.int64)
@@ -105,6 +107,8 @@ def _attn_fwd(
     lut_offset = (idx_bh * M_BLOCKS + idx_m) * topk
     o_offset = idx_bh * L * D
     denom_offset = idx_bh * L
+    h_acc_offset = (idx_bh * M_BLOCKS + idx_m) * CD * D
+    z_acc_offset = (idx_bh * M_BLOCKS + idx_m) * CD
 
     offs_m = idx_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, D)
@@ -116,6 +120,8 @@ def _attn_fwd(
     LUT_ptr = LUT + lut_offset
     O_ptrs = O + o_offset + offs_m[:, None] * D + offs_d[None, :]
     DENOM_ptrs = DENOM + denom_offset + offs_m
+    H_ACC_ptrs = H_ACC + h_acc_offset + offs_cd[:, None] * D + offs_d[None, :]
+    Z_ACC_ptrs = Z_ACC + z_acc_offset + offs_cd
 
     # Initialize accumulators for H_i and Z_i
     h_acc = tl.zeros([CD, D], dtype=tl.float32)
@@ -147,6 +153,9 @@ def _attn_fwd(
 
     tl.store(O_ptrs, o.to(O.type.element_ty), mask=offs_m[:, None] < L)
     tl.store(DENOM_ptrs, denom, mask=offs_m < L)
+    # Store accumulated H and Z for backward pass
+    tl.store(H_ACC_ptrs, h_acc.to(H_ACC.type.element_ty))
+    tl.store(Z_ACC_ptrs, z_acc.to(Z_ACC.type.element_ty))
 
 
 @triton.jit
@@ -418,6 +427,10 @@ class _sparse_linear_attention(torch.autograd.Function):
         h = torch.empty((B, H, N_BLOCKS, CD, D), device=v.device, dtype=v.dtype)
         z = torch.empty((B, H, N_BLOCKS, CD), device=v.device, dtype=v.dtype)
 
+        # Accumulated h and z per query block (computed in kernel, not Python)
+        h_acc = torch.empty((B, H, M_BLOCKS, CD, D), device=v.device, dtype=v.dtype)
+        z_acc = torch.empty((B, H, M_BLOCKS, CD), device=v.device, dtype=v.dtype)
+
         # Step 1: Precompute h_j = (K^phi_j)^T @ V_j and z_j = rowsum((K^phi_j)^T)
         grid_preprocess = (N_BLOCKS, B * H)
         _attn_fwd_preprocess[grid_preprocess](
@@ -425,40 +438,15 @@ class _sparse_linear_attention(torch.autograd.Function):
             L, N_BLOCKS, D, CD, BLOCK_N
         )
 
-        # Step 2: Sparse accumulation and output computation
+        # Step 2: Sparse accumulation, output computation, and h_acc/z_acc computation
+        # h_acc and z_acc are computed directly in the kernel (no Python gather+sum)
         grid_fwd = (M_BLOCKS, B * H)
         _attn_fwd[grid_fwd](
-            c_q, h, z, lut, denom, o,
+            c_q, h, z, lut, denom, o, h_acc, z_acc,
             topk, L, M_BLOCKS, N_BLOCKS, D, CD, BLOCK_M, BLOCK_N,
             num_warps=4 if D == 64 else 8,
             num_stages=3
         )
-
-        # For backward: we need to recompute H_acc and Z_acc per query block
-        # Store them during forward for efficiency
-        # Vectorized implementation to avoid Python for loops
-        h_flat = h.view(B * H, N_BLOCKS, CD, D)  # [BH, N, CD, D]
-        z_flat = z.view(B * H, N_BLOCKS, CD)      # [BH, N, CD]
-        lut_flat = lut.view(B * H, M_BLOCKS, topk)  # [BH, M, topk]
-
-        # Use advanced indexing to gather h and z values
-        # lut_expanded for h: [BH, M, topk] -> [BH, M, topk, CD, D]
-        lut_h = lut_flat.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, CD, D)
-        # h_flat expanded: [BH, N, CD, D] -> [BH, 1, N, CD, D]
-        h_expanded = h_flat.unsqueeze(1).expand(-1, M_BLOCKS, -1, -1, -1)
-        # Gather: [BH, M, topk, CD, D]
-        h_gathered = torch.gather(h_expanded, 2, lut_h)
-        # Sum over topk: [BH, M, CD, D]
-        h_acc = h_gathered.sum(dim=2).view(B, H, M_BLOCKS, CD, D)
-
-        # lut_expanded for z: [BH, M, topk] -> [BH, M, topk, CD]
-        lut_z = lut_flat.unsqueeze(-1).expand(-1, -1, -1, CD)
-        # z_flat expanded: [BH, N, CD] -> [BH, 1, N, CD]
-        z_expanded = z_flat.unsqueeze(1).expand(-1, M_BLOCKS, -1, -1)
-        # Gather: [BH, M, topk, CD]
-        z_gathered = torch.gather(z_expanded, 2, lut_z)
-        # Sum over topk: [BH, M, CD]
-        z_acc = z_gathered.sum(dim=2).view(B, H, M_BLOCKS, CD)
 
         ctx.save_for_backward(c_q, c_k, v, k_block_id, lut, denom, o, h, z, h_acc, z_acc)
         ctx.topk = topk
